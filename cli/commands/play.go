@@ -177,13 +177,10 @@ func (gameState *GameState) Run() error {
 	}
 	// modified by yabust
 	// send turn zero to websocket server
+	// ターン0だけここで処理しないとうまくいかない
 	// decord json file into event
 	var event board.GameEvent
 	json.NewDecoder(strings.NewReader(scanner.Text())).Decode(&event)
-	fmt.Print("output EventType : ")
-	fmt.Println(event.EventType)
-	fmt.Print("output Data : ")
-	fmt.Println(event.Data)
 	boardServer.SendEvent(event)
 	fmt.Println(event)
 	log.INFO.Printf("Ruleset: %v, Seed: %v", gameState.GameType, gameState.Seed)

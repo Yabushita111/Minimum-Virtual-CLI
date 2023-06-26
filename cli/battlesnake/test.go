@@ -2,105 +2,58 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
-	"strings"
-	"time"
 
-	"github.com/BattlesnakeOfficial/rules"
-	"github.com/BattlesnakeOfficial/rules/board"
-	"github.com/BattlesnakeOfficial/rules/maps"
+	"golang.org/x/net/websocket"
+
 	"github.com/pkg/browser"
 	log "github.com/spf13/jwalterweatherman"
 )
 
-type SnakeState struct {
-	URL        string
-	Name       string
-	ID         string
-	LastMove   string
-	Character  rune
-	Color      string
-	Head       string
-	Tail       string
-	Author     string
-	Version    string
-	Error      error
-	StatusCode int
-	Latency    time.Duration
+var events chan GameEvent
+
+type GameEvent struct {
+	MyEvent string `json:"myData"`
 }
 
-type GameState struct {
-	// Options
-	Width               int
-	Height              int
-	Names               []string
-	URLs                []string
-	Timeout             int
-	TurnDuration        int
-	Sequential          bool
-	GameType            string
-	MapName             string
-	ViewMap             bool
-	UseColor            bool
-	Seed                int64
-	TurnDelay           int
-	OutputPath          string
-	ViewInBrowser       bool
-	BoardURL            string
-	FoodSpawnChance     int
-	MinimumFood         int
-	HazardDamagePerTurn int
-	ShrinkEveryNTurns   int
+var gameID = "8d25c551-d275-4fb5-948e-2baa48f32a7a"
+var battlelogPath = "/Users/yabu/Battlesnake-rules/cli/battlesnake/battlelog/"
+var filename = battlelogPath + gameID + ".json"
+var file, _ = os.Open(filename)
+var scanner = bufio.NewScanner(file)
 
-	// Internal game state
-	settings    map[string]string
-	snakeStates map[string]SnakeState
-	gameID      string
-	httpClient  TimedHttpClient
-	ruleset     rules.Ruleset
-	gameMap     maps.GameMap
-	outputFile  io.WriteCloser
-	idGenerator func(int) string
+func main() {
+	events = make(chan GameEvent, 1000)
+	http.HandleFunc("/games/"+gameID, handleGame)
+	http.HandleFunc("/games/"+gameID+"/events", handleWebsocket)
+	go func() {
+		err := http.ListenAndServe(":8888", nil)
+		if err != http.ErrServerClosed {
+			log.ERROR.Printf("Error in board HTTP server: %v", err)
+		}
+	}()
+	board := "localhost:3000"
+	serverURL := "localhost:8080"
+	boardURL := fmt.Sprintf(board+"?engine=%s&game=%s&autoplay=true", serverURL, gameID)
+	log.INFO.Printf("Opening board URL: %s", boardURL)
+	if err := browser.OpenURL(boardURL); err != nil {
+		log.ERROR.Printf("Failed to open browser: %v", err)
+	}
 }
 
-func (gameState *GameState) Initialize() error {
-	// Generate game ID
-	gameState.gameID = "8d25c551-d275-4fb5-948e-2baa48f32a7a"
-
-	// Set up HTTP client with request timeout
-	if gameState.Timeout == 0 {
-		gameState.Timeout = 500
-	}
-	gameState.httpClient = timedHTTPClient{
-		&http.Client{
-			Timeout: time.Duration(gameState.Timeout) * time.Millisecond,
-		},
-	}
-	return nil
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
-func (gameState *GameState) Run() error {
-	boardGame := board.Game{
-		ID:     gameState.gameID,
-		Status: "running",
-		Width:  gameState.Width,
-		Height: gameState.Height,
-		Ruleset: map[string]string{
-			rules.ParamGameType: gameState.GameType,
-		},
-		RulesetName: gameState.GameType,
-		RulesStages: []string{},
-		Map:         gameState.MapName,
-	}
-	//modified by yabust
-	// read turn0 (first line) in json file
+func handleGame(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Content-Type", "application/json")
+	gameID := "8d25c551-d275-4fb5-948e-2baa48f32a7a"
 	battlelogPath := "/Users/yabu/Battlesnake-rules/cli/battlesnake/battlelog/"
-	battleid := "8d25c551-d275-4fb5-948e-2baa48f32a7a"
-	filename := battlelogPath + battleid + ".json"
+	filename := battlelogPath + gameID + ".json"
 	file, err := os.Open(filename)
 	if err != nil {
 		panic(err)
@@ -108,49 +61,20 @@ func (gameState *GameState) Run() error {
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	scanner.Scan()
-
-	// function for calling browsers
-	boardServer := board.NewBoardServer(boardGame)
-	serverURL, err := boardServer.Listen()
-	if err != nil {
-		fmt.Println("Error starting HTTP server: %w", err)
-	}
-	defer boardServer.Shutdown()
-	fmt.Println(serverURL)
-	boardURL := "http://localhost:3000"
-	browserURL := fmt.Sprintf(boardURL+"?engine=%s&game=%s&autoplay=true", serverURL, gameState.gameID)
-	browser.OpenURL(browserURL)
-
-	//modified by yabust
-	// send turn zero to websocket server
-	// decord json file into event
-	var event board.GameEvent
-	json.NewDecoder(strings.NewReader(scanner.Text())).Decode(&event)
-	fmt.Println(event)
-	fmt.Println("*****************************")
-	boardServer.SendEvent(event)
-	for scanner.Scan() {
-		// modified by yabust
-		// decord json file into event
-		var event board.GameEvent
-		json.NewDecoder(strings.NewReader(scanner.Text())).Decode(&event)
-		boardServer.SendEvent(event)
-		fmt.Println(event)
-		fmt.Println("*****************************")
-	}
-	boardServer.SendEvent(board.GameEvent{
-		EventType: board.EVENT_TYPE_GAME_END,
-		Data:      boardGame,
-	})
-	return nil
+	events <- GameEvent{scanner.Text()}
 }
-
-func main() {
-	gameState := &GameState{}
-	if err := gameState.Initialize(); err != nil {
-		log.ERROR.Fatalf("Error initializing game: %v", err)
+func handleWebsocket(w http.ResponseWriter, r *http.Request) {
+	ws, _ := upgrader.Upgrade(w, r, nil)
+	defer ws.Close()
+	gameID := "8d25c551-d275-4fb5-948e-2baa48f32a7a"
+	battlelogPath := "/Users/yabu/Battlesnake-rules/cli/battlesnake/battlelog/"
+	filename := battlelogPath + gameID + ".json"
+	file, err := os.Open(filename)
+	if err != nil {
+		panic(err)
 	}
-	if err := gameState.Run(); err != nil {
-		log.ERROR.Fatalf("Error running game: %v", err)
-	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Scan()
+	websocket.JSON.Send(ws, scanner.Text())
 }
